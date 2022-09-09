@@ -19,6 +19,7 @@ depends: [
   "ca-certs"
   "fmt"
   "bos"
+  "paf"
   "happy-eyeballs-lwt"
   "h2" {>= "0.9.0"}
 ]

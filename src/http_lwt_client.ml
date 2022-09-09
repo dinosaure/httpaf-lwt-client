@@ -1,5 +1,95 @@
 open Lwt_result.Infix
 
+module type IO = sig
+  type t
+
+  val read : t -> Bigstringaf.t -> int -> int -> int Lwt.t
+  val write : t -> Bigstringaf.t -> int -> int -> int Lwt.t
+  val close : t -> unit Lwt.t
+end
+
+type endpoint = |
+
+module Make (IO : IO) = struct
+  open Lwt.Infix
+
+  type flow = int * IO.t
+  type error = [ `Unix of Unix.error * string * string ]
+  type write_error = [ `Closed | `Unix of Unix.error * string * string ]
+  type nonrec endpoint = endpoint
+
+  let connect : endpoint -> (flow, write_error) result Lwt.t = function _ -> .
+
+  let pp_error ppf (`Unix (err, f, arg)) = Fmt.pf ppf "%s(%s): %s" f arg (Unix.error_message err)
+  let pp_write_error ppf = function
+    | `Closed -> Fmt.pf ppf "Connection closed by peer"
+    | `Unix (err, f, arg) ->
+      Fmt.pf ppf "%s(%s): %s" f arg (Unix.error_message err)
+
+  let read (max, flow) =
+    let { Cstruct.buffer; off; len; } as cs = Cstruct.create max in
+    Lwt.catch
+      (fun () -> IO.read flow buffer off len >>= function
+      | 0 -> Lwt.return_ok `Eof
+      | len' -> Lwt.return_ok (`Data (Cstruct.sub cs 0 len')))
+      (function
+      | Unix.Unix_error (err, f, arg) ->
+        Lwt.return_error (`Unix (err, f, arg))
+      | exn -> raise exn)
+
+  let rec write (_, flow) cs = go flow cs
+  and go flow cs =
+      if Cstruct.length cs = 0 then Lwt.return_ok ()
+      else let { Cstruct.buffer; off; len; } = cs in
+           Lwt.catch
+             (fun () -> IO.write flow buffer off len >>= fun len' ->
+                        go flow (Cstruct.shift cs len'))
+             (function
+             | Unix.Unix_error (err, f, arg) ->
+               Lwt.return_error (`Unix (err, f, arg))
+             | exn -> raise exn)
+
+  let writev flow css =
+    let rec go = function
+      | [] -> Lwt.return_ok ()
+      | x :: r -> write flow x >>= function
+        | Ok () -> go r | Error _ as err -> Lwt.return err in
+    go css
+
+  let close (_, flow) =
+    Lwt.catch (fun () -> IO.close flow)
+      (fun _exn -> Lwt.return ())
+end
+
+let _, tcpip_protocol = Mimic.register ~name:"tcp/ip"
+  (module Make (struct
+     type t = Lwt_unix.file_descr
+     let read = Lwt_bytes.read
+     let write = Lwt_bytes.write
+     let close = Lwt_unix.close end))
+
+let _, tls_protocol = Mimic.register ~name:"tls"
+  (module Make (struct
+     open Lwt.Infix
+
+     type t = Tls_lwt.Unix.t
+     let read fd buf off len =
+       let cs = Cstruct.of_bigarray buf ~off ~len in
+       Tls_lwt.Unix.read fd cs
+     let write fd buf off len =
+       let cs = Cstruct.of_bigarray buf ~off ~len in
+       Tls_lwt.Unix.write fd cs >>= fun () ->
+       Lwt.return len
+     let close = Tls_lwt.Unix.close end))
+
+let sleep v = Lwt_unix.sleep (Int64.to_float v)
+module Unix_flow = (val (Mimic.repr tcpip_protocol))
+module Tls_flow = (val (Mimic.repr tls_protocol))
+
+let fd_to_mimic_flow ~read_buffer_size = function
+  | `Plain fd -> Unix_flow.T (read_buffer_size, fd)
+  | `Tls flow -> Tls_flow.T (read_buffer_size, flow)
+
 let open_err r =
   let open Lwt.Infix in
   r >|= function Ok _ as r -> r | Error (`Msg _) as r -> r
@@ -100,6 +190,13 @@ let pp_response ppf { version ; status ; reason ; headers } =
   Format.fprintf ppf "((version \"%a\") (status %a) (reason %S) (headers %a))"
     Version.pp_hum version Status.pp_hum status reason Headers.pp_hum headers
 
+module HTTP_1_1 = struct
+  include Httpaf.Client_connection
+  let yield_reader _ = assert false
+  let next_read_operation t =
+    (next_read_operation t :> [ `Close | `Read | `Yield ])
+end
+
 let single_http_1_1_request ?config fd user_pass host meth path headers body =
   let blen = match body with None -> None | Some x -> Some (String.length x) in
   let headers = prep_http_1_1_headers headers host user_pass blen in
@@ -148,10 +245,12 @@ let single_http_1_1_request ?config fd user_pass host meth path headers body =
     Httpaf.Client_connection.request ?config req ~error_handler ~response_handler
   in
   let read_buffer_size = match config with
-    | Some config -> Some config.Httpaf.Config.read_buffer_size
-    | None -> None
+    | Some config -> config.Httpaf.Config.read_buffer_size
+    | None -> Httpaf.Config.default.Httpaf.Config.read_buffer_size
   in
-  Http_lwt_unix.Client_HTTP_1_1.request ?read_buffer_size fd connection ;
+  Lwt.async (fun () ->
+    Paf.run (module HTTP_1_1)
+      ~sleep connection (fd_to_mimic_flow ~read_buffer_size fd));
   (match body with
    | Some body -> Httpaf.Body.write_string request_body body
    | None -> ());
@@ -211,15 +310,18 @@ let single_h2_request ?config fd scheme user_pass host meth path headers body =
     H2.Client_connection.request connection req ~error_handler ~response_handler
   in
   let read_buffer_size = match config with
-    | Some config -> Some config.H2.Config.read_buffer_size
-    | None -> None
+    | Some config -> config.H2.Config.read_buffer_size
+    | None -> H2.Config.default.H2.Config.read_buffer_size
   in
-  Http_lwt_unix.Client_H2.request ?read_buffer_size fd connection ;
+  Lwt.async (fun () ->
+    Paf.run (module H2.Client_connection)
+      ~sleep connection (fd_to_mimic_flow ~read_buffer_size fd));
   (match body with
    | Some body -> H2.Body.Writer.write_string request_body body
    | None -> ());
   H2.Body.Writer.close request_body;
-  finished
+  finished >|= fun v ->
+  H2.Client_connection.shutdown connection ; v
 
 let alpn_protocol = function
   | `Plain _ -> None

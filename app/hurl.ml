@@ -29,10 +29,25 @@ let jump () protocol uri meth headers output input =
       Logs.err (fun m -> m "error %s" msg);
       e)
 
+let reporter ppf =
+  let report src level ~over k msgf =
+    let k _ =
+      over () ;
+      k () in
+    let with_metadata header _tags k ppf fmt =
+      Format.kfprintf k ppf
+        ("[%a]%a[%a]: " ^^ fmt ^^ "\n%!")
+        Fmt.(styled `Blue int)
+        (Unix.getpid ()) Logs_fmt.pp_header (level, header)
+        Fmt.(styled `Magenta string)
+        (Logs.Src.name src) in
+    msgf @@ fun ?header ?tags fmt -> with_metadata header tags k ppf fmt in
+  { Logs.report }
+
 let setup_log style_renderer level =
   Fmt_tty.setup_std_outputs ?style_renderer ();
   Logs.set_level level;
-  Logs.set_reporter (Logs_fmt.reporter ~dst:Format.std_formatter ())
+  Logs.set_reporter (reporter Format.std_formatter)
 
 open Cmdliner
 
